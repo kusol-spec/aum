@@ -1117,6 +1117,60 @@
         let selectedLeaveCategory = "";
         let selectedFileName = "";
 
+        // ==================== [เชื่อมต่อ Google Sheets ผ่าน Apps Script] ====================
+        // *** วาง "ลิงก์ exec" ของ Apps Script คุณตรงนี้บรรทัดเดียวเท่านั้น ***
+        // เอาลิงก์ที่ได้จาก Deploy > Web app (ลงท้ายด้วย /exec) มาแทนที่ข้อความในเครื่องหมายคำพูดด้านล่าง
+        // ไฟล์นี้ใช้ได้ทั้ง 2 แบบ: เปิดตรง ๆ จากเครื่อง / ฝากไว้บน GitHub Pages ก็เชื่อมกับ Google Sheets ได้เหมือนกัน
+        const APPS_SCRIPT_URL = "https://script.google.com/macros/s/AKfycbyNyMyskKAnPYQ8Z7WwiIT8Y31O_iqtEeo8QodfZJ_qyJ0JvZ5nH_SjSFRizdCNp0f2ZA/exec";
+
+        const hasServer = !!APPS_SCRIPT_URL && APPS_SCRIPT_URL.indexOf("https://script.google.com/") === 0;
+
+        // เรียกฟังก์ชันฝั่ง Apps Script ผ่าน fetch (ใช้ได้ไม่ว่าไฟล์นี้จะถูกเปิดจากที่ไหนก็ตาม)
+        function callServer_(fnName, successCb, ...args) {
+            if (!hasServer) {
+                console.warn(`[โหมดพรีวิว] จะเรียก ${fnName} แต่ยังไม่ได้ใส่ลิงก์ APPS_SCRIPT_URL ที่ถูกต้อง`);
+                return;
+            }
+            const url = `${APPS_SCRIPT_URL}?action=${encodeURIComponent(fnName)}&args=${encodeURIComponent(JSON.stringify(args))}`;
+            fetch(url)
+                .then(res => res.json())
+                .then(res => {
+                    if (!res.ok) {
+                        showToast("บันทึกลง Google Sheets ไม่สำเร็จ: " + res.error, "error");
+                        return;
+                    }
+                    if (successCb) successCb(res.data);
+                })
+                .catch(err => showToast("เชื่อมต่อ Google Sheets ไม่สำเร็จ: " + err.message, "error"));
+        }
+
+        // โหลดข้อมูลจริงจาก Google Sheets ตอนเปิดหน้าเว็บ (แทนที่ข้อมูลตัวอย่างในเครื่อง)
+        function loadDataFromServer_(callback) {
+            if (!hasServer) {
+                console.warn("[โหมดพรีวิว] ยังไม่ได้ใส่ลิงก์ APPS_SCRIPT_URL - ใช้ข้อมูลตัวอย่างในไฟล์แทน");
+                if (callback) callback();
+                return;
+            }
+            fetch(`${APPS_SCRIPT_URL}?action=getAllData`)
+                .then(res => res.json())
+                .then(res => {
+                    if (!res.ok) throw new Error(res.error);
+                    const data = res.data;
+                    studentsList = data.students || [];
+                    teachersList = data.teachers || [];
+                    leaveRequests = data.leaveRequests || [];
+                    studentAttendanceData = data.studentAttendanceData || {};
+                    if (data.gradeSubjects && Object.keys(data.gradeSubjects).length > 0) {
+                        gradeSubjects = data.gradeSubjects;
+                    }
+                    if (callback) callback();
+                })
+                .catch(err => {
+                    showToast("โหลดข้อมูลจาก Google Sheets ไม่สำเร็จ: " + err.message, "error");
+                    if (callback) callback();
+                });
+        }
+
         // เติมหมายเลขวัน (1-31) ลงในปุ่มตัวเลือกแบบไดนามิก
         function populateDayDropdowns() {
             const startDaySel = document.getElementById('start-day');
@@ -1224,7 +1278,9 @@
                 // ค้นหาในทะเบียนเพื่อความสมจริง หากไม่เจอจะเพิ่มให้โดยอัตโนมัติ
                 const found = studentsList.find(s => s.id === studentId);
                 if (!found) {
-                    studentsList.push({ id: studentId, name: name, class: studentClass, status: "ปกติ" });
+                    const newStudent = { id: studentId, name: name, class: studentClass, status: "ปกติ" };
+                    studentsList.push(newStudent);
+                    callServer_("addStudent", null, newStudent);
                 }
 
                 currentUser = {
@@ -1415,6 +1471,14 @@
             leaveRequests.unshift(newRequest);
             showToast(`ส่งใบลาเรียนของ ${currentUser.name} เรียบร้อยแล้ว`, "success");
 
+            // บันทึกใบลาลง Google Sheets จริง แล้วอัปเดตรหัสใบลาให้ตรงกับที่เซิร์ฟเวอร์สร้างให้
+            callServer_("addLeaveRequest", function (result) {
+                if (result && result.id) {
+                    newRequest.id = result.id;
+                    renderData();
+                }
+            }, newRequest);
+
             // รีเซ็ตค่าตัวเลือก
             document.getElementById('start-day').value = "";
             document.getElementById('start-month').value = "";
@@ -1453,9 +1517,11 @@
                         if (rSubject === "ทุกวิชา (ทั้งวัน)") {
                             for (let key in studentAttendanceData[rId]) {
                                 studentAttendanceData[rId][key].leave += 1;
+                                callServer_("updateAttendance", null, rId, key, studentAttendanceData[rId][key].leave, studentAttendanceData[rId][key].absent);
                             }
                         } else if (studentAttendanceData[rId][rSubject]) {
                             studentAttendanceData[rId][rSubject].leave += 1;
+                            callServer_("updateAttendance", null, rId, rSubject, studentAttendanceData[rId][rSubject].leave, studentAttendanceData[rId][rSubject].absent);
                         }
                     }
                     showToast(`อนุมัติคำขอของ ${leaveRequests[index].studentName} สำเร็จ และอัปเดตสถิติเวลาเรียนแล้ว`, "success");
@@ -1464,6 +1530,7 @@
                     showToast(`ปฏิเสธคำขอของ ${leaveRequests[index].studentName} เรียบร้อย`, "error");
                 }
 
+                callServer_("updateLeaveRequestStatus", null, id, newStatus, leaveRequests[index].teacherComment);
                 renderData();
             }
         }
@@ -1486,6 +1553,7 @@
                         showToast(`นักเรียนมีประวัติเข้าเรียนปกติอยู่แล้ว`, "info");
                     }
                 }
+                callServer_("updateAttendance", null, sId, subject, studentAttendanceData[sId][subject].leave, studentAttendanceData[sId][subject].absent);
                 renderData();
             }
         }
@@ -1496,6 +1564,7 @@
             if (index !== -1) {
                 const name = leaveRequests[index].studentName;
                 leaveRequests.splice(index, 1);
+                callServer_("deleteLeaveRequest", null, id);
                 showToast(`ลบข้อมูลคำขอลาของ ${name} สำเร็จ`, "success");
                 renderData();
             }
@@ -2015,12 +2084,15 @@
             }
 
             // เพิ่มนักเรียนลงทำเนียบ
-            studentsList.push({ id: stdId, name: name, class: stdClass, status: "ปกติ" });
+            const newStudent = { id: stdId, name: name, class: stdClass, status: "ปกติ" };
+            studentsList.push(newStudent);
+            callServer_("addStudent", null, newStudent);
             
             // สร้างข้อมูลสถิติเวลาเรียนว่างเปล่าของวิชาใหม่ทั้งหมด
             studentAttendanceData[stdId] = {};
             for (let key of defaultSubjectsList) {
                 studentAttendanceData[stdId][key] = { leave: 0, absent: 0 };
+                callServer_("updateAttendance", null, stdId, key, 0, 0);
             }
 
             showToast(`เพิ่มรายชื่อคุณ ${name} เข้าฐานข้อมูลทะเบียนเรียนสำเร็จ`, "success");
@@ -2039,6 +2111,7 @@
                 studentsList.splice(index, 1);
                 // ลบสถิติที่เกี่ยวข้อง
                 delete studentAttendanceData[id];
+                callServer_("deleteStudent", null, id);
                 
                 showToast(`ลบชื่อและประวัติเวลาเรียนของ ${name} พ้นระบบแล้ว`, "success");
                 renderData();
@@ -2189,7 +2262,10 @@
         // เริ่มต้นเรียกใช้ฟังก์ชันเมื่อเปิดหน้าต่างขึ้นมา
         window.onload = function() {
             populateDayDropdowns();
-            renderData();
+            // โหลดข้อมูลจริงจาก Google Sheets ก่อน แล้วค่อยวาดหน้าจอ
+            loadDataFromServer_(function () {
+                renderData();
+            });
         };
     </script>
 </body>
